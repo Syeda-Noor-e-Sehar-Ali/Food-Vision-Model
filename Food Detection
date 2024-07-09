@@ -1,0 +1,297 @@
+# Steps To Build the Food Vision Model
+
+## What we're going to cover
+1. Using TensorFlow Datasets to download and explore data
+2. Creating preprocessing function for our data
+3. Batching & preparing datasets for modelling (making our datasets run fast)
+4. Creating modelling callbacks
+5. Setting up mixed precision training
+6. Building a feature extraction model (see transfer learning part 1: feature extraction)
+7. Fine-tuning the feature extraction model (see transfer learning part 2: fine-tuning)
+8. Viewing training results on TensorBoard
+
+# Importing the important libraries
+import os
+import tensorflow as tf
+import tensorflow.keras as keras
+from tensorflow.keras import layers
+
+### Get the Helper Functions
+
+if not os.path.exists('helper_functions.py'):
+  print('downloading the helper functions file')
+  !wget https://raw.githubusercontent.com/mrdbourke/tensorflow-deep-learning/main/extras/helper_functions.py
+else:
+  print('Helper functions already exists skipping the downloading')
+
+# Import series of helper functions for the notebook (we've created/used these in previous notebooks)
+from helper_functions import create_tensorboard_callback, plot_loss_curves, compare_historys
+
+## 1. Using TensorFlow Datasets to download and explore data
+
+# Get tensorflow datasets as tfds
+import tensorflow_datasets as tfds
+
+# List available datasets
+available_datasets = tfds.list_builders()
+print('food101' in available_datasets)
+
+# Load the data
+(train_data, test_data), ds_info = tfds.load('food101',
+                                             split=['train', 'validation'],
+                                             shuffle_files=True,
+                                             as_supervised=True,
+                                             with_info=True)
+
+# Features of food101 dataset
+ds_info.features
+
+class_names = ds_info.features['label'].names
+class_names[:10]
+
+# Take one sampe out of the training set
+take_one_sample = train_data.take(1)
+take_one_sample
+
+for image, label in take_one_sample:
+  print(f"""
+  Image Shape: {image.shape}
+  Image dtype: {image.dtype}
+  Target Class from Food101 (tensor form): {label}
+  Class Name (str form): {class_names[label.numpy()]}
+  """)
+
+# What are the min and max values?
+tf.reduce_min(image), tf.reduce_max(image)
+
+# Plotting the image tensor
+import matplotlib.pyplot as plt
+plt.imshow(image)
+plt.title(class_names[label.numpy()])
+plt.axis(False)
+
+## 2. Create Preprocessing Function for our data
+
+# Make a function for preprocessing images
+def preprocess_img(image, label, img_shape=224):
+  """
+  Converts image datatype from 'uint8' -> 'float32' and reshapes image to
+  [img_shape, img_shape, color_channels]
+  """
+  image = tf.image.resize(image, [img_shape, img_shape]) # reshape to img_shape
+  return tf.cast(image, tf.float32), label # return (float32_image, label) tuple
+
+# Preprocess a single sample image and check the outputs
+preprocessed_img = preprocess_img(image, label)[0]
+print(f"Image before preprocessing:\n {image[:2]}...,\nShape: {image.shape},\nDatatype: {image.dtype}\n")
+print(f"Image after preprocessing:\n {preprocessed_img[:2]}...,\nShape: {preprocessed_img.shape},\nDatatype: {preprocessed_img.dtype}")
+
+# We can still plot our preprocessed image as long as we
+# divide by 255 (for matplotlib capatibility)
+plt.imshow(preprocessed_img/255.)
+plt.title(class_names[label])
+plt.axis(False);
+
+### 3. Batching and preparing dataset for modelling
+
+# map preprocessing_image function to train data and (parallelize)
+train_data = train_data.map(map_func=preprocess_img, num_parallel_calls=tf.data.AUTOTUNE)
+train_data = train_data.shuffle(buffer_size=1000).batch(batch_size=32).prefetch(buffer_size=tf.data.AUTOTUNE)
+
+# Map preprocessing_image function to test data
+test_data = test_data.map(map_func=preprocess_img, num_parallel_calls=tf.data.AUTOTUNE)
+test_data = test_data.batch(32).prefetch(tf.data.AUTOTUNE)
+
+train_data, test_data
+
+## 4. Creating modelling callbacks
+
+# Create TensorBoard callback (already have "create_tensorboard_callback()" from a previous notebook)
+from helper_functions import create_tensorboard_callback
+# Create modelCheckpoint
+checkpoint_path = 'model_checkpoints/cp.ckpt'
+model_checkpoint = tf.keras.callbacks.ModelCheckpoint(checkpoint_path,
+                                                      monitor='val_accuracy',
+                                                      verbose=1,
+                                                      save_best_only=True,
+                                                      save_weights_only=True)
+
+## 5. Setting up mixed precision training
+
+!ls
+
+!nvidia-smi -L
+
+# Turn on mixed training policy
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy(policy='mixed_float16') # set global policy of mixed_float16
+
+mixed_precision.global_policy()
+
+## 6. Building a feature extraction model
+
+from tensorflow.keras import layers
+from tensorflow.keras.layers.experimental import preprocessing
+
+# Create the base model
+input_shape=(224,224,3)
+base_model = tf.keras.applications.EfficientNetB0(include_top=False)
+base_model.trainable = False # Freeze all layers for training
+
+# create the functional model
+inputs = layers.Input(input_shape, name='input_layer', dtype=tf.float16)
+# x = base_model(preprocessing.Rescaling(1./255))
+x = base_model(inputs, training=False)
+x = layers.GlobalAveragePooling2D(name='Global_average_pooling')(x)
+x = layers.Dense(len(class_names))(x)
+outputs = layers.Activation('softmax', dtype=tf.float32, name='softmax_float32')(x)
+model = tf.keras.Model(inputs, outputs)
+
+model.compile(loss='sparse_categorical_crossentropy', # using sparse because labels are not one-hto encoded
+              optimizer=tf.keras.optimizers.Adam(),
+              metrics=['accuracy'])
+
+model.summary()
+
+# Check to see if the mixed precision is active or not
+for layer in model.layers:
+  print(layer.name, layer.trainable,layer.dtype, layer.dtype_policy)
+
+for layer in model.layers[1].layers[:20]:
+  print(layer.name, layer.trainable,layer.dtype, layer.dtype_policy)
+
+# Fitting our model
+history_101_food_classes_feature_extract = model.fit(train_data,
+                                                     epochs=3,
+                                                     steps_per_epoch=len(train_data),
+                                                     validation_data=test_data,
+                                                     validation_steps=int(0.15 * len(test_data)),
+                                                     callbacks=[create_tensorboard_callback('training_logs', 'all_data_feature_extract'),
+                                                                model_checkpoint])
+
+# Results feature extract model
+results_feature_extract_model = model.evaluate(test_data)
+results_feature_extract_model
+
+### Load and Evaluate checkpoint weights
+
+cloned_model = tf.keras.models.clone_model(model)
+cloned_model.summary()
+
+cloned_model.load_weights(checkpoint_path)
+
+# Recompile the model
+cloned_model.compile(loss='sparse_categorical_crossentropy', optimizer=tf.keras.optimizers.Adam(),metrics=['accuracy'])
+
+results_cloned_model_feature = cloned_model.evaluate(train_data)
+
+import numpy as np
+np.isclose(results_feature_extract_model, results_cloned_model_feature)
+
+# Check the layers in the base model and see what dtype policy they're using
+for layer in cloned_model.layers[1].layers[:20]: # check only the first 20 layers to save space
+  print(layer.name, layer.trainable, layer.dtype, layer.dtype_policy)
+
+# saving the model to the drive
+import os
+save_dir= '/content/drive/MyDrive/tensorflow_models/food_vison_big_data_with_3epochs_training'
+os.makedirs(save_dir)
+
+model.save(save_dir)
+
+# loading saved model and evaluating to check
+loaded_saved_model = tf.keras.models.load_model(save_dir)
+
+results_loaded_saved_model = loaded_saved_model.evaluate(train_data)
+
+np.isclose(results_loaded_saved_model, results_feature_extract_model)
+
+## 7. Fine Tuning the model by unfreezing more layers of basenet0 model
+
+# Downloading the model from the google storage
+!wget https://storage.googleapis.com/ztm_tf_course/food_vision/07_efficientnetb0_feature_extract_model_mixed_precision.zip
+
+# unzip the downloaded model
+!mkdir downloaded_gs_model
+!unzip 07_efficientnetb0_feature_extract_model_mixed_precision.zip -d downloaded_gs_model
+
+# Load and evaluate downloaded GS model
+tf.get_logger().setLevel('INFO') # hide warning logs
+loaded_gs_model = tf.keras.models.load_model("downloaded_gs_model/07_efficientnetb0_feature_extract_model_mixed_precision")
+
+loaded_gs_model.summary()
+
+results_loaded_gs_model =loaded_gs_model.evaluate(train_data)
+
+for layer in loaded_gs_model.layers:
+  layer.trainable = True
+  print(layer.name, layer.trainable, layer.dtype, layer.dtype_policy)
+
+# Setup to early stop the model training if the model don't improve for 3 epochs
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                  patience=3,
+                                                  verbose=1)
+checkpoint_path = 'fine_tune_checkpoint/'
+model_checkpoint = tf.keras.callbacks.ModelCheckpoint(checkpoint_path,
+                                                      monitor='val_loss',
+                                                      save_best_only=True)
+
+# Create Learning rate reduction callback
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss',
+                                                 factior=0.2,
+                                                 patience=2,
+                                                 verbose=1,
+                                                 min_lr=1e-7)
+
+# Compile the model
+loaded_gs_model.compile(loss='sparse_categorical_crossentropy',
+                        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+                        metrics=['accuracy'])
+
+# Fit
+history_101_food_fine_tune = loaded_gs_model.fit(train_data,
+                                                 epochs=5,
+                                                 steps_per_epoch=len(train_data),
+                                                 validation_data=test_data,
+                                                 validation_steps=int(0.15*len(test_data)),
+                                                 callbacks=[create_tensorboard_callback('training_logs', 'efficientb0_101_food_fine_tuning'),
+                                                            model_checkpoint,
+                                                            reduce_lr,
+                                                            early_stopping])
+
+# save model to the google drive
+model_saving_path = '/content/drive/MyDrive/tensorflow_models/101_full_training_with_fine_tuning'
+os.makedirs(model_saving_path)
+
+loaded_gs_model.save(model_saving_path)
+
+
+# Checking to see model expect what input
+# config = loaded_gs_model.config()
+# config['layers'][0]['config']['batch_input_shape'] # Failed experiment
+
+loaded_gs_model.summary()
+
+def predict_the_image(model, path):
+  # load image and turn it into tensor to make prediction
+  import matplotlib.pyplot as plt
+  import matplotlib.image as plimg
+  image = plimg.imread(path)
+
+  # reshape and expand it to make it compatible with the model
+  pizza_image = tf.image.resize(image, [224,224])
+  pizza_image = tf.expand_dims(pizza_image, axis=0)
+
+  #make prediction
+  prediction = model.predict(pizza_image)
+  pred_class_name = class_names[prediction.argmax()]
+
+  #show the result
+  plt.imshow(image)
+  plt.axis(False)
+  plt.title(f"Prediction: {pred_class_name} with prob{prediction.max()}")
+
+
+
+predict_the_image(loaded_gs_model, 'pizza.jpg')
+
